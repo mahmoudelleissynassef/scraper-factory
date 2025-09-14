@@ -1,90 +1,88 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List, Optional
 import requests
 from bs4 import BeautifulSoup
-from datetime import date
+from datetime import datetime
 import re
 
 app = FastAPI()
 
-# Input model
+# ---- INPUT MODEL ----
 class ScrapeInput(BaseModel):
-    url: str
-    city: str
-    asset_type: str
-    site_name: str
+    url: str        # e.g. "https://www.mubawab.ma/en/st/casablanca/office-for-rent"
+    city: str       # e.g. "Casablanca"
+    asset_type: str # e.g. "Offices"
+    site_name: str  # e.g. "Mubawab"
 
-# Output model
-class Listing(BaseModel):
-    title: str
-    price: Optional[float]
-    currency: Optional[str]
-    area: Optional[float]
-    unit: Optional[str]
-    location: Optional[str]
-    image: Optional[str]
-    link: str
-    retrieved_at: str
-    price_per_sqm: Optional[float]
-
-def parse_price(price_text: str):
-    if not price_text or "request" in price_text.lower():
-        return None, None
-    match = re.match(r"([\d.,]+)\s*([A-Za-z]+)", price_text.replace(",", ""))
-    if match:
-        value = float(match.group(1))
-        currency = match.group(2)
-        return value, currency
-    return None, None
-
-def parse_area(title: str):
-    match = re.search(r"(\d+)\s*(m²|sqm|m2)", title)
-    if match:
-        return float(match.group(1)), match.group(2)
-    return None, None
-
-def parse_location(title: str):
-    if " in " in title:
-        after_in = title.split(" in ", 1)[1]
-        location = after_in.split(".")[0].strip()
-        return location
-    return None
-
-@app.post("/scrape", response_model=List[Listing])
-def scrape(input_data: ScrapeInput):
-    url = input_data.url
-    city = input_data.city
-    asset_type = input_data.asset_type
-    site_name = input_data.site_name
-
+# ---- SCRAPER ----
+def scrape_mubawab(url: str, city: str, asset_type: str, site_name: str):
     listings = []
     page = 1
+    today = datetime.today().strftime("%Y-%m-%d")
+
     while True:
-        paged_url = f"{url}:o:{page}"
-        res = requests.get(paged_url, headers={"User-Agent": "Mozilla/5.0"})
-        if res.status_code != 200:
+        paginated_url = f"{url}?p={page}"
+        r = requests.get(paginated_url, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
             break
 
-        soup = BeautifulSoup(res.text, "html.parser")
-        cards = soup.select("div.property-list div.property")
-        if not cards:
+        soup = BeautifulSoup(r.text, "html.parser")
+        ads = soup.select("li.listingBox")  # Each listing container
+        if not ads:
             break
 
-        for card in cards:
-            title = card.select_one("h2").get_text(strip=True) if card.select_one("h2") else ""
-            price_text = card.select_one(".price").get_text(strip=True) if card.select_one(".price") else None
-            image = card.select_one("img")["src"] if card.select_one("img") else None
-            link = "https://www.mubawab.ma" + card.select_one("a")["href"] if card.select_one("a") else None
+        for ad in ads:
+            try:
+                title = ad.select_one(".listingBoxTitle").get_text(strip=True)
+            except:
+                title = ""
 
-            price, currency = parse_price(price_text) if price_text else (None, None)
-            area, unit = parse_area(title)
-            location = parse_location(title)
+            try:
+                link = "https://www.mubawab.ma" + ad.select_one("a")["href"]
+            except:
+                link = ""
 
-            # Compute price per sqm if both values exist
-            price_per_sqm = None
-            if price and area and area > 10 and price > 100:  # filter obvious junk
-                price_per_sqm = round(price / area, 2)
+            try:
+                image = ad.select_one("img")["src"]
+            except:
+                image = ""
+
+            # Price
+            try:
+                raw_price = ad.select_one(".price").get_text(strip=True)
+                match = re.match(r"([\d,\.]+)\s*([A-Za-z]+)", raw_price.replace(",", ""))
+                if match:
+                    price = float(match.group(1))
+                    currency = match.group(2)
+                else:
+                    price, currency = None, None
+            except:
+                price, currency = None, None
+
+            # Area
+            try:
+                raw_area = ad.select_one(".property span:contains('m²')").get_text(strip=True)
+                match = re.match(r"([\d,\.]+)\s*(m²)", raw_area.replace(",", ""))
+                if match:
+                    area = float(match.group(1))
+                    unit = match.group(2)
+                else:
+                    area, unit = None, None
+            except:
+                area, unit = None, None
+
+            # Location (from title text "in {location}.")
+            location = ""
+            if " in " in title:
+                parts = title.split(" in ")
+                if len(parts) > 1:
+                    location = parts[1].split(".")[0].strip()
+
+            # Price per sqm
+            try:
+                price_per_sqm = round(price / area, 2) if price and area and area > 0 else None
+            except:
+                price_per_sqm = None
 
             listings.append({
                 "title": title,
@@ -95,10 +93,24 @@ def scrape(input_data: ScrapeInput):
                 "location": location,
                 "image": image,
                 "link": link,
-                "retrieved_at": str(date.today()),
-                "price_per_sqm": price_per_sqm
+                "retrieved_at": today,
+                "price_per_sqm": price_per_sqm,
+                "city": city,
+                "asset_type": asset_type,
+                "site_name": site_name
             })
 
         page += 1
 
     return listings
+
+# ---- ROUTES ----
+@app.get("/")
+def home():
+    return {"message": "Scraper API is running"}
+
+@app.post("/scrape")
+def scrape(data: ScrapeInput):
+    if "mubawab.ma" in data.url:
+        return scrape_mubawab(data.url, data.city, data.asset_type, data.site_name)
+    return {"error": "Unsupported site"}
