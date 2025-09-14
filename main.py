@@ -5,112 +5,174 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 import re
 
-app = FastAPI()
+app = FastAPI(title="Scraper Factory", version="0.1.0")
 
-# ---- INPUT MODEL ----
+# ---------- Input model ----------
 class ScrapeInput(BaseModel):
-    url: str        # e.g. "https://www.mubawab.ma/en/st/casablanca/office-for-rent"
-    city: str       # e.g. "Casablanca"
-    asset_type: str # e.g. "Offices"
-    site_name: str  # e.g. "Mubawab"
+    url: str                # listings page URL (e.g., Mubawab city page)
+    city: str               # e.g., "Casablanca"
+    asset_type: str         # e.g., "Offices"
+    site_name: str          # e.g., "Mubawab"
 
-# ---- SCRAPER ----
-def scrape_mubawab(url: str, city: str, asset_type: str, site_name: str):
-    listings = []
-    page = 1
-    today = datetime.today().strftime("%Y-%m-%d")
+# ---------- Helpers ----------
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36"}
 
-    while True:
-        paginated_url = f"{url}?p={page}"
-        r = requests.get(paginated_url, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200:
-            break
+def number_from_text(txt: str) -> float | None:
+    if not txt:
+        return None
+    # keep digits, comma, dot, space; then normalize
+    cleaned = re.sub(r"[^\d.,\s]", "", txt).strip()
+    if not cleaned:
+        return None
+    # Remove spaces in numbers like "1 200"
+    cleaned = cleaned.replace(" ", "")
+    # If there are both comma and dot, assume comma is thousands
+    if "," in cleaned and "." in cleaned:
+        cleaned = cleaned.replace(",", "")
+    else:
+        # If only comma, treat it as decimal separator
+        if "," in cleaned:
+            cleaned = cleaned.replace(",", ".")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
 
-        soup = BeautifulSoup(r.text, "html.parser")
-        ads = soup.select("li.listingBox")  # Each listing container
-        if not ads:
-            break
+def parse_price(text: str) -> tuple[float | None, str | None]:
+    """Return (price_number, currency). Accepts e.g. '9,000 DH', 'Price on request'."""
+    if not text:
+        return (None, None)
+    if "price on request" in text.lower():
+        return (None, None)
 
-        for ad in ads:
-            try:
-                title = ad.select_one(".listingBoxTitle").get_text(strip=True)
-            except:
-                title = ""
+    m = re.search(r"([\d\s.,]+)\s*([A-Za-z]{1,4})?", text)
+    if not m:
+        return (None, None)
+    price_val = number_from_text(m.group(1))
+    currency = m.group(2) or None
+    return (price_val, currency)
 
-            try:
-                link = "https://www.mubawab.ma" + ad.select_one("a")["href"]
-            except:
-                link = ""
+def parse_area(text: str) -> tuple[float | None, str | None]:
+    """Return (area_number, unit). Accepts '200 m²', '150 m2', etc."""
+    if not text:
+        return (None, None)
+    m = re.search(r"([\d\s.,]+)\s*(m²|m2|sqm)", text, flags=re.I)
+    if not m:
+        return (None, None)
+    area_val = number_from_text(m.group(1))
+    unit = m.group(2)
+    # normalize unit
+    unit = "m²"
+    return (area_val, unit)
 
-            try:
-                image = ad.select_one("img")["src"]
-            except:
-                image = ""
+def location_from_title(title: str) -> str | None:
+    """Fallback: pull location from title between 'in ' and first '.'"""
+    if not title:
+        return None
+    m = re.search(r"\bin\s+([^\.]+)", title, flags=re.I)
+    return m.group(1).strip() if m else None
 
-            # Price
-            try:
-                raw_price = ad.select_one(".price").get_text(strip=True)
-                match = re.match(r"([\d,\.]+)\s*([A-Za-z]+)", raw_price.replace(",", ""))
-                if match:
-                    price = float(match.group(1))
-                    currency = match.group(2)
-                else:
-                    price, currency = None, None
-            except:
-                price, currency = None, None
+def absolute_link(href: str) -> str | None:
+    if not href:
+        return None
+    if href.startswith("http"):
+        return href
+    return "https://www.mubawab.ma" + href
 
-            # Area
-            try:
-                raw_area = ad.select_one(".property span:contains('m²')").get_text(strip=True)
-                match = re.match(r"([\d,\.]+)\s*(m²)", raw_area.replace(",", ""))
-                if match:
-                    area = float(match.group(1))
-                    unit = match.group(2)
-                else:
-                    area, unit = None, None
-            except:
-                area, unit = None, None
+# ---------- Scraper ----------
+def scrape_mubawab_list_page(url: str, city: str, asset_type: str, site_name: str) -> list[dict]:
+    res = requests.get(url, headers=UA, timeout=30)
+    res.raise_for_status()
+    soup = BeautifulSoup(res.text, "html.parser")
 
-            # Location (from title text "in {location}.")
-            location = ""
-            if " in " in title:
-                parts = title.split(" in ")
-                if len(parts) > 1:
-                    location = parts[1].split(".")[0].strip()
+    items: list[dict] = []
 
-            # Price per sqm
-            try:
-                price_per_sqm = round(price / area, 2) if price and area and area > 0 else None
-            except:
-                price_per_sqm = None
+    # Each listing card
+    # From your DevTools: <div class="listingBox sPremium" ...> (sometimes without sPremium)
+    for box in soup.select("div.listingBox"):
+        # Title
+        title_tag = box.select_one(".titleRow")
+        title = title_tag.get_text(strip=True) if title_tag else ""
 
-            listings.append({
-                "title": title,
-                "price": price,
-                "currency": currency,
-                "area": area,
-                "unit": unit,
-                "location": location,
-                "image": image,
-                "link": link,
-                "retrieved_at": today,
-                "price_per_sqm": price_per_sqm,
-                "city": city,
-                "asset_type": asset_type,
-                "site_name": site_name
-            })
+        # Price
+        price_tag = box.select_one(".priceBar")
+        price_raw = price_tag.get_text(strip=True) if price_tag else ""
+        price_val, currency = parse_price(price_raw)
 
-        page += 1
+        # Location (prefer the explicit bar; else fallback to title)
+        loc_tag = box.select_one(".contactbar")
+        location = loc_tag.get_text(strip=True) if loc_tag else location_from_title(title)
 
-    return listings
+        # Area (there may be several 'disFlex flexCol' blocks; the one with m² text is the target)
+        area_val = None
+        unit = None
+        for feat in box.select("div.disFlex.flexCol"):
+            txt = feat.get_text(" ", strip=True)
+            a, u = parse_area(txt)
+            if a:
+                area_val, unit = a, u
+                break
 
-# ---- ROUTES ----
+        # Link (Mubawab often sets linkref on the container, or there is an inner <a>)
+        link = box.get("linkref")
+        if not link:
+            a_tag = box.select_one("a[href]")
+            link = a_tag.get("href") if a_tag else None
+        link = absolute_link(link) if link else None
+
+        # Image (best-effort)
+        img = None
+        img_tag = box.find("img")
+        if img_tag:
+            img = img_tag.get("src") or img_tag.get("data-src") or img_tag.get("data-lazy") or None
+            if img and img.startswith("//"):
+                img = "https:" + img
+
+        # Price per sqm
+        price_per_sqm = None
+        if price_val and area_val and area_val > 0:
+            price_per_sqm = round(price_val / area_val, 2)
+
+        items.append({
+            "title": title or "",
+            "price": price_val if price_val is not None else "",
+            "currency": currency or "",
+            "area": area_val if area_val is not None else "",
+            "unit": unit or "",
+            "location": location or "",
+            "image": img or "",
+            "link": link or "",
+            "retrieved_at": datetime.today().strftime("%Y-%m-%d"),
+            "price_per_sqm": price_per_sqm if price_per_sqm is not None else ""
+        })
+
+    return items
+
+# ---------- Routes ----------
 @app.get("/")
 def home():
-    return {"message": "Scraper API is running"}
+    return {"message": "API is running!"}
 
 @app.post("/scrape")
-def scrape(data: ScrapeInput):
-    if "mubawab.ma" in data.url:
-        return scrape_mubawab(data.url, data.city, data.asset_type, data.site_name)
-    return {"error": "Unsupported site"}
+def scrape(input: ScrapeInput):
+    """
+    Currently supports Mubawab listing pages (server-rendered).
+    Required fields in the body:
+    {
+      "url": "https://www.mubawab.ma/en/st/casablanca/office-for-rent",
+      "city": "Casablanca",
+      "asset_type": "Offices",
+      "site_name": "Mubawab"
+    }
+    """
+    # Basic domain routing (you can extend later for other sites)
+    if "mubawab.ma" in input.url:
+        return scrape_mubawab_list_page(
+            url=input.url,
+            city=input.city,
+            asset_type=input.asset_type,
+            site_name=input.site_name,
+        )
+
+    # Unknown site → empty list (or raise a 400 if you prefer)
+    return []
