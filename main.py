@@ -64,6 +64,19 @@ def parse_price(text: str) -> tuple[Optional[float], Optional[str]]:
     return value, cur.upper()
 
 
+def normalize_listing(item: dict) -> dict:
+    """Ensure every listing has the same fields as Mubawab output."""
+    keys = [
+        "title", "price", "currency", "area", "unit", "location", "image", "link",
+        "retrieved_at", "price_per_sqm",
+        "city", "asset_type", "site_name", "listing_type", "document_name"
+    ]
+    for k in keys:
+        if k not in item:
+            item[k] = None
+    return item
+
+
 # ---------- Async HTTP ----------
 async def fetch_page(client, url: str) -> Optional[str]:
     try:
@@ -130,7 +143,7 @@ def parse_mubawab(html: str) -> List[dict]:
         if img:
             image = img.get("data-src") or img.get("src")
 
-        results.append({
+        results.append(normalize_listing({
             "title": title or "",
             "price": price,
             "currency": currency or "",
@@ -141,7 +154,7 @@ def parse_mubawab(html: str) -> List[dict]:
             "link": link or "",
             "retrieved_at": str(date.today()),
             "price_per_sqm": round(price/area_val, 2) if price and area_val else None,
-        })
+        }))
     return results
 
 
@@ -168,7 +181,7 @@ async def parse_coinafrique_detail(client, url: str) -> dict:
 # ---------- CoinAfrique Search Parser ----------
 async def parse_coinafrique(html: str, client) -> List[dict]:
     soup = BeautifulSoup(html, "html.parser")
-    cards = soup.select("div.annonce, div.annonce-item")
+    cards = soup.select("div.annonce-item, article.annonce")
     results, tasks = [], []
 
     for box in cards:
@@ -194,7 +207,7 @@ async def parse_coinafrique(html: str, client) -> List[dict]:
         img_tag = box.find("img")
         image = img_tag.get("src") if img_tag else ""
 
-        item = {
+        item = normalize_listing({
             "title": title,
             "price": price_val,
             "currency": currency or "CFA",
@@ -205,13 +218,13 @@ async def parse_coinafrique(html: str, client) -> List[dict]:
             "link": link,
             "retrieved_at": str(date.today()),
             "price_per_sqm": None,
-        }
+        })
         results.append(item)
 
         if link:
             tasks.append(parse_coinafrique_detail(client, link))
 
-    # Fetch details
+    # Fetch detail pages concurrently
     details = await asyncio.gather(*tasks, return_exceptions=True)
     for item, detail in zip(results, details):
         if isinstance(detail, dict):
@@ -230,7 +243,12 @@ async def scrape_pages(base_url: str, pages: int, site: str) -> List[dict]:
     limits = httpx.Limits(max_connections=CONCURRENCY)
     async with httpx.AsyncClient(limits=limits) as client:
         for page in range(1, pages + 1):
-            url = base_url if page == 1 else f"{base_url}&page={page}"
+            if site == "coinafrique":
+                url = base_url if page == 1 else f"{base_url}&page={page}"
+            elif site == "mubawab":
+                url = base_url if page == 1 else f"{base_url}:p:{page}"
+            else:
+                url = base_url
             tasks.append(fetch_page(client, url))
 
         responses = await asyncio.gather(*tasks, return_exceptions=True)
