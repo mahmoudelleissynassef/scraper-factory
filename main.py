@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List
 from datetime import date
 import re
 import httpx
@@ -39,13 +39,16 @@ def clean_spaces(t: str) -> str:
 def parse_mubawab(html: str, metadata: dict):
     soup = BeautifulSoup(html, "html.parser")
     cards = soup.select("div.listingBox")
+
     if not cards:
-        print("DEBUG: No cards found with div.listingBox")
+        print("DEBUG: No Mubawab cards found with div.listingBox")
         return []
 
     items = []
     for box in cards:
         title = clean_spaces(box.get_text(" ", strip=True))[:120]
+
+        # Link
         link_tag = box.find("a", href=True)
         link = ""
         if link_tag:
@@ -74,24 +77,22 @@ def parse_mubawab(html: str, metadata: dict):
 
 
 def parse_coinafrique(html: str, metadata: dict):
-    # CoinAfrique loads JSON in <script> tags, so debug dump first
+    # CoinAfrique embeds JSON; log snippet until we refine parsing
     json_snippet = re.search(r"\{.*\}", html, re.S)
     if not json_snippet:
-        print("DEBUG: No JSON snippet found in page")
+        print("DEBUG: No CoinAfrique JSON snippet found")
         return []
 
     text = json_snippet.group(0)
-    print("DEBUG JSON snippet:", text[:1000])  # show first 1000 chars
-
-    # TODO: refine parsing once we confirm structure
-    return []
+    print("DEBUG CoinAfrique JSON snippet:", text[:1000])  # first 1000 chars
+    return []  # TODO: refine parsing once JSON structure confirmed
 
 
 # ---------- Router ----------
 def parse_site(html: str, metadata: dict):
     site = metadata.get("site_name", "").lower()
     print(f"DEBUG SITE={site}")
-    print("DEBUG HTML snippet:", html[:1000])  # log first 1000 chars
+    print("DEBUG HTML snippet:", html[:1000])
 
     if "mubawab" in site:
         return parse_mubawab(html, metadata)
@@ -107,10 +108,13 @@ async def scrape_pages(base_url: str, metadata: dict, pages: int):
 
     async with httpx.AsyncClient(headers=UA, timeout=20) as client:
         for page in range(1, pages + 1):
+            # Pagination rules
             if "coinafrique" in metadata["site_name"].lower():
                 url = base_url if page == 1 else f"{base_url}&page={page}"
-            else:
+            elif "mubawab" in metadata["site_name"].lower():
                 url = base_url if page == 1 else f"{base_url}:p:{page}"
+            else:
+                url = base_url
 
             print(f"DEBUG Fetching: {url}")
             try:
