@@ -20,8 +20,9 @@ UA = {
         "Chrome/124.0.0.0 Safari/537.36"
     )
 }
-MAX_PAGES = 200      # safety cap
-CONCURRENCY = 5      # max concurrent requests
+MAX_PAGES = 200
+CONCURRENCY = 5
+
 
 # ---------- Models ----------
 class ScrapeInput(BaseModel):
@@ -42,21 +43,18 @@ def clean_spaces(t: str) -> str:
 def parse_price(text: str) -> tuple[Optional[float], Optional[str]]:
     if not text:
         return None, None
-    if re.search(r"price\s*on\s*request", text, re.I):
-        return None, None
-
-    m = re.search(r"(?P<num>\d[\d\s.,]*)\s*(?P<cur>DH|MAD|DHS|€|\$)", text, re.I)
+    m = re.search(r"([\d\s.,]+)\s*(CFA|FCFA|DH|MAD|DHS|€|\$)", text, re.I)
     if not m:
-        m = re.search(r"(DH|MAD|DHS|€|\$)\s*(\d[\d\s.,]*)", text, re.I)
+        m = re.search(r"(CFA|FCFA|DH|MAD|DHS|€|\$)\s*([\d\s.,]+)", text, re.I)
         if not m:
             return None, None
         num, cur = m.group(2), m.group(1)
     else:
-        num, cur = m.group("num"), m.group("cur")
+        num, cur = m.group(1), m.group(2)
 
     num = num.replace(" ", "").replace(",", "").replace("\u202f", "")
     try:
-        value = float(num.replace(".", "")) if num.count(".") > 1 else float(num.replace(",", ""))
+        value = float(num.replace(".", "")) if num.count(".") > 1 else float(num)
     except ValueError:
         digits = re.sub(r"[^\d.]", "", num)
         try:
@@ -66,39 +64,7 @@ def parse_price(text: str) -> tuple[Optional[float], Optional[str]]:
     return value, cur.upper()
 
 
-def parse_area(text: str) -> tuple[Optional[float], Optional[str]]:
-    if not text:
-        return None, None
-    m = re.search(r"(?P<num>\d+[\d\s.,]*)\s*(?P<unit>m²|m2|sqm)", text, re.I)
-    if not m:
-        return None, None
-    raw, unit = m.group("num"), m.group("unit")
-    raw = raw.replace(" ", "").replace("\u202f", "").replace(",", "")
-    try:
-        val = float(raw)
-    except ValueError:
-        val = None
-    unit_norm = "m²" if unit.lower() in ("m²", "m2") else "sqm"
-    return val, unit_norm
-
-
-def extract_location_from_title(title: str) -> Optional[str]:
-    if not title:
-        return None
-    m = re.search(r"\bin\s+([^.\-]+)", title, re.I)
-    if m:
-        return clean_spaces(m.group(1))
-    return None
-
-
-def first_attr(tag, *attrs) -> Optional[str]:
-    for a in attrs:
-        if tag and tag.has_attr(a) and tag[a]:
-            return tag[a]
-    return None
-
-
-# ---------- Async Scraper ----------
+# ---------- Async HTTP ----------
 async def fetch_page(client, url: str) -> Optional[str]:
     try:
         resp = await client.get(url, headers=UA, timeout=15.0)
@@ -112,7 +78,8 @@ async def fetch_page(client, url: str) -> Optional[str]:
         return None
 
 
-def parse_listings(html: str) -> List[dict]:
+# ---------- Mubawab Parser ----------
+def parse_mubawab(html: str) -> List[dict]:
     soup = BeautifulSoup(html, "html.parser")
     cards = soup.select("div.listingBox")
     if not cards:
@@ -149,23 +116,19 @@ def parse_listings(html: str) -> List[dict]:
         area_val, unit = None, None
         area_string = box.find(string=re.compile(r"\d[\d\s.,]*\s*(m²|m2|sqm)", re.I))
         if area_string:
-            area_val, unit = parse_area(str(area_string))
+            m = re.search(r"(\d[\d\s.,]*)\s*(m²|m2|sqm)", str(area_string))
+            if m:
+                try:
+                    area_val = float(m.group(1).replace(" ", "").replace(",", ""))
+                    unit = "m²"
+                except:
+                    pass
 
         # Image
         img = box.find("img")
         image = None
         if img:
-            image = first_attr(img, "data-src", "src", "data-lazy", "data-original", "srcset")
-            if image and " " in image and "http" in image:
-                image = image.split(",")[0].strip().split(" ")[0]
-
-        # Location
-        location = extract_location_from_title(title) or ""
-
-        # Price per sqm
-        ppsqm = None
-        if price and area_val and area_val > 0:
-            ppsqm = round(price / area_val, 2)
+            image = img.get("data-src") or img.get("src")
 
         results.append({
             "title": title or "",
@@ -173,62 +136,148 @@ def parse_listings(html: str) -> List[dict]:
             "currency": currency or "",
             "area": area_val,
             "unit": unit or "",
-            "location": location,
+            "location": "",
             "image": image or "",
             "link": link or "",
             "retrieved_at": str(date.today()),
-            "price_per_sqm": ppsqm,
+            "price_per_sqm": round(price/area_val, 2) if price and area_val else None,
         })
     return results
 
 
-async def scrape_mubawab_list_page(base_url: str, pages: int) -> List[dict]:
+# ---------- CoinAfrique Detail Parser ----------
+async def parse_coinafrique_detail(client, url: str) -> dict:
+    html = await fetch_page(client, url)
+    if not html:
+        return {}
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Area
+    area_val, unit = None, None
+    area_tag = soup.find(string=re.compile(r"(\d+)\s*m2", re.I))
+    if area_tag:
+        m = re.search(r"(\d+)\s*m2", area_tag)
+        if m:
+            area_val = float(m.group(1))
+            unit = "m²"
+
+    return {"area": area_val, "unit": unit or ""}
+
+
+# ---------- CoinAfrique Search Parser ----------
+async def parse_coinafrique(html: str, client) -> List[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    cards = soup.select("div.annonce, div.annonce-item")
+    results, tasks = [], []
+
+    for box in cards:
+        # Title
+        title_tag = box.select_one("h2, h3, a")
+        title = clean_spaces(title_tag.get_text(strip=True)) if title_tag else ""
+
+        # Link
+        a_tag = box.find("a", href=True)
+        link = a_tag["href"] if a_tag else ""
+        if link.startswith("/"):
+            link = "https://ci.coinafrique.com" + link
+
+        # Price
+        price_tag = box.select_one(".price")
+        price_val, currency = parse_price(price_tag.get_text(strip=True)) if price_tag else (None, "CFA")
+
+        # Location
+        loc_tag = box.select_one(".location")
+        location = clean_spaces(loc_tag.get_text(strip=True)) if loc_tag else ""
+
+        # Image
+        img_tag = box.find("img")
+        image = img_tag.get("src") if img_tag else ""
+
+        item = {
+            "title": title,
+            "price": price_val,
+            "currency": currency or "CFA",
+            "area": None,
+            "unit": "",
+            "location": location,
+            "image": image,
+            "link": link,
+            "retrieved_at": str(date.today()),
+            "price_per_sqm": None,
+        }
+        results.append(item)
+
+        if link:
+            tasks.append(parse_coinafrique_detail(client, link))
+
+    # Fetch details
+    details = await asyncio.gather(*tasks, return_exceptions=True)
+    for item, detail in zip(results, details):
+        if isinstance(detail, dict):
+            item.update(detail)
+            if item.get("price") and item.get("area"):
+                item["price_per_sqm"] = round(item["price"] / item["area"], 2)
+
+    return results
+
+
+# ---------- Async Scraper ----------
+async def scrape_pages(base_url: str, pages: int, site: str) -> List[dict]:
     pages = max(1, min(pages, MAX_PAGES))
-    tasks = []
-    results: List[dict] = []
+    tasks, results = [], []
 
     limits = httpx.Limits(max_connections=CONCURRENCY)
     async with httpx.AsyncClient(limits=limits) as client:
         for page in range(1, pages + 1):
-            url = base_url if page == 1 else f"{base_url}:p:{page}"
+            url = base_url if page == 1 else f"{base_url}&page={page}"
             tasks.append(fetch_page(client, url))
 
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-    for i, resp in enumerate(responses, start=1):
-        if isinstance(resp, Exception) or not resp:
-            print(f"[WARN] Skipping page {i}, failed fetch.")
-            continue
-        listings = parse_listings(resp)
-        if not listings:
-            print(f"[INFO] No listings found on page {i}, stopping.")
-            break
-        results.extend(listings)
+        for i, resp in enumerate(responses, start=1):
+            if isinstance(resp, Exception) or not resp:
+                print(f"[WARN] Skipping page {i}")
+                continue
+
+            if site == "mubawab":
+                listings = parse_mubawab(resp)
+            elif site == "coinafrique":
+                listings = await parse_coinafrique(resp, client)
+            else:
+                listings = []
+
+            if not listings:
+                break
+            results.extend(listings)
+
     return results
 
 
 # ---------- API ----------
 @app.get("/")
 def home():
-    return {"message": "API factory is running!"}
+    return {"message": "Scraper API is running!"}
 
 
 @app.post("/scrape")
 async def scrape(input: ScrapeInput):
     try:
         if "mubawab.ma" in input.url:
-            data = await scrape_mubawab_list_page(input.url, input.pages)
+            data = await scrape_pages(input.url, input.pages, "mubawab")
+        elif "coinafrique.com" in input.url:
+            data = await scrape_pages(input.url, input.pages, "coinafrique")
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported site")
 
-            # Attach metadata from Scraper Config
-            for item in data:
-                item["city"] = input.city
-                item["asset_type"] = input.asset_type
-                item["site_name"] = input.site_name
-                item["listing_type"] = input.listing_type
-                item["document_name"] = input.document_name or ""
+        # Attach metadata
+        for item in data:
+            item["city"] = input.city
+            item["asset_type"] = input.asset_type
+            item["site_name"] = input.site_name
+            item["listing_type"] = input.listing_type
+            item["document_name"] = input.document_name or ""
 
-            return data
-
-        raise HTTPException(status_code=400, detail="Unsupported site. Currently only: Mubawab.")
+        return data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
