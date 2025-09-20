@@ -8,7 +8,7 @@ import re
 import httpx
 from bs4 import BeautifulSoup
 
-# ---------- FastAPI ----------
+# ---------- FastAPI App ----------
 app = FastAPI()
 
 # ---------- Config ----------
@@ -19,8 +19,8 @@ UA = {
         "Chrome/124.0.0.0 Safari/537.36"
     )
 }
-MAX_PAGES = 200
-CONCURRENCY = 5
+MAX_PAGES = 200      # safety cap
+CONCURRENCY = 5      # max concurrent requests
 
 # ---------- Models ----------
 class ScrapeInput(BaseModel):
@@ -30,17 +30,20 @@ class ScrapeInput(BaseModel):
     site_name: str
     listing_type: str
     document_name: Optional[str] = None
-    pages: int = 9999
+    pages: int = 9999  # scrape until no more listings, capped at MAX_PAGES
 
-# ---------- Utils ----------
+
+# ---------- Utilities ----------
 def clean_spaces(t: str) -> str:
-    return re.sub(r"\s+", " ", t).strip() if t else ""
+    return re.sub(r"\s+", " ", t).strip()
+
 
 def parse_price(text: str):
     if not text:
         return None, None
     if re.search(r"price\s*on\s*request", text, re.I):
         return None, None
+
     m = re.search(r"(?P<num>\d[\d\s.,]*)\s*(?P<cur>DH|MAD|DHS|€|\$)", text, re.I)
     if not m:
         m = re.search(r"(DH|MAD|DHS|€|\$)\s*(\d[\d\s.,]*)", text, re.I)
@@ -49,11 +52,15 @@ def parse_price(text: str):
         num, cur = m.group(2), m.group(1)
     else:
         num, cur = m.group("num"), m.group("cur")
+
     num = num.replace(" ", "").replace(",", "").replace("\u202f", "")
     try:
-        return float(num), cur.upper()
-    except:
+        value = float(num)
+    except ValueError:
         return None, cur.upper()
+
+    return value, cur.upper()
+
 
 def parse_area(text: str):
     if not text:
@@ -64,43 +71,55 @@ def parse_area(text: str):
     raw, unit = m.group("num"), m.group("unit")
     raw = raw.replace(" ", "").replace("\u202f", "").replace(",", "")
     try:
-        return float(raw), unit
-    except:
+        val = float(raw)
+    except ValueError:
         return None, unit
+    return val, unit
+
 
 def extract_location_from_title(title: str) -> Optional[str]:
     if not title:
         return None
     m = re.search(r"\bin\s+([^.\-]+)", title, re.I)
-    return clean_spaces(m.group(1)) if m else None
+    return m.group(1).strip() if m else None
 
-def first_attr(tag, *attrs):
+
+def first_attr(tag, *attrs) -> Optional[str]:
     for a in attrs:
-        if tag.has_attr(a):
+        if tag and tag.has_attr(a):
             return tag[a]
     return None
 
-# ---------- Async Scraper ----------
+
+# ---------- Async helpers ----------
 async def fetch_page(client, url: str) -> Optional[str]:
     try:
         resp = await client.get(url, headers=UA, timeout=15.0)
         if resp.status_code == 200:
             return resp.text
-        return None
+        else:
+            print(f"[WARN] {url} returned {resp.status_code}")
+            return None
     except Exception as e:
-        print(f"[ERROR] {url} failed: {e}")
+        print(f"[ERROR] Request failed for {url}: {e}")
         return None
+
 
 def parse_listings(html: str) -> List[dict]:
     soup = BeautifulSoup(html, "html.parser")
-    cards = soup.select("div.listingBox") or soup.select("div.adlist, div.contentBox, div.box")
+    cards = soup.select("div.listingBox")
+    if not cards:
+        cards = soup.select("div.adlist, div.contentBox, div.box")
+
     results = []
     for box in cards:
         text_all = box.get_text(" ", strip=True)
 
         # Title
+        title = None
         title_tag = box.select_one(".listTitle, .titleRow, p.listingP, .disFlex.titleRow")
-        title = clean_spaces(title_tag.get_text(" ", strip=True)) if title_tag else None
+        if title_tag:
+            title = clean_spaces(title_tag.get_text(" ", strip=True))
         if not title:
             a = box.find("a", href=True)
             if a and len(a.get_text(strip=True)) > 5:
@@ -153,46 +172,58 @@ def parse_listings(html: str) -> List[dict]:
             "retrieved_at": str(date.today()),
             "price_per_sqm": ppsqm,
         })
+
     return results
+
 
 async def scrape_mubawab_list_page(base_url: str, pages: int) -> List[dict]:
     pages = max(1, min(pages, MAX_PAGES))
-    tasks, results = [], []
+    results: List[dict] = []
 
     limits = httpx.Limits(max_connections=CONCURRENCY)
     async with httpx.AsyncClient(limits=limits) as client:
         for page in range(1, pages + 1):
             url = base_url if page == 1 else f"{base_url}:p:{page}"
-            tasks.append(fetch_page(client, url))
+            print(f"[INFO] Fetching {url}")
 
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
+            resp = await fetch_page(client, url)
+            if not resp:
+                print(f"[WARN] Failed to fetch {url}, stopping.")
+                break
 
-    for i, resp in enumerate(responses, start=1):
-        if not resp or isinstance(resp, Exception):
-            print(f"[WARN] Skipping page {i}")
-            continue
-        listings = parse_listings(resp)
-        if not listings:
-            print(f"[INFO] Stopping early at page {i}, no more listings.")
-            break
-        results.extend(listings)
+            listings = parse_listings(resp)
+            if not listings:
+                print(f"[INFO] No listings found on page {page}, stopping early.")
+                break   # 🚨 auto-stop here
+
+            results.extend(listings)
+            print(f"[INFO] Scraped {len(listings)} listings from page {page}")
 
     return results
+
 
 # ---------- API ----------
 @app.get("/")
 def home():
-    return {"status": "ok", "service": "Mubawab Scraper"}
+    return {"status": "ok", "message": "Mubawab Scraper running"}
+
 
 @app.post("/scrape")
 async def scrape(input: ScrapeInput):
-    if "mubawab.ma" in input.url:
-        data = await scrape_mubawab_list_page(input.url, input.pages)
-        for item in data:
-            item["city"] = input.city
-            item["asset_type"] = input.asset_type
-            item["site_name"] = input.site_name
-            item["listing_type"] = input.listing_type
-            item["document_name"] = input.document_name or ""
-        return data
-    raise HTTPException(status_code=400, detail="Unsupported site. Currently only: Mubawab.")
+    try:
+        if "mubawab.ma" in input.url:
+            data = await scrape_mubawab_list_page(input.url, input.pages)
+
+            # Attach metadata
+            for item in data:
+                item["city"] = input.city
+                item["asset_type"] = input.asset_type
+                item["site_name"] = input.site_name
+                item["listing_type"] = input.listing_type
+                item["document_name"] = input.document_name or ""
+
+            return data
+
+        raise HTTPException(status_code=400, detail="Unsupported site. Currently only: Mubawab.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
