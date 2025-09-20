@@ -22,7 +22,6 @@ UA = {
 MAX_PAGES = 200
 CONCURRENCY = 5
 
-
 # ---------- Models ----------
 class ScrapeInput(BaseModel):
     url: str
@@ -33,11 +32,9 @@ class ScrapeInput(BaseModel):
     document_name: Optional[str] = None
     pages: int = 9999
 
-
 # ---------- Utils ----------
 def clean_spaces(t: str) -> str:
     return re.sub(r"\s+", " ", t).strip() if t else ""
-
 
 def parse_price(text: str):
     if not text:
@@ -58,7 +55,6 @@ def parse_price(text: str):
     except:
         return None, cur.upper()
 
-
 def parse_area(text: str):
     if not text:
         return None, None
@@ -72,20 +68,17 @@ def parse_area(text: str):
     except:
         return None, unit
 
-
 def extract_location_from_title(title: str) -> Optional[str]:
     if not title:
         return None
     m = re.search(r"\bin\s+([^.\-]+)", title, re.I)
     return clean_spaces(m.group(1)) if m else None
 
-
 def first_attr(tag, *attrs):
     for a in attrs:
         if tag.has_attr(a):
             return tag[a]
     return None
-
 
 # ---------- Async Scraper ----------
 async def fetch_page(client, url: str) -> Optional[str]:
@@ -97,7 +90,6 @@ async def fetch_page(client, url: str) -> Optional[str]:
     except Exception as e:
         print(f"[ERROR] {url} failed: {e}")
         return None
-
 
 def parse_listings(html: str) -> List[dict]:
     soup = BeautifulSoup(html, "html.parser")
@@ -163,7 +155,6 @@ def parse_listings(html: str) -> List[dict]:
         })
     return results
 
-
 async def scrape_mubawab_list_page(base_url: str, pages: int) -> List[dict]:
     pages = max(1, min(pages, MAX_PAGES))
     tasks, results = [], []
@@ -188,12 +179,10 @@ async def scrape_mubawab_list_page(base_url: str, pages: int) -> List[dict]:
 
     return results
 
-
 # ---------- API ----------
 @app.get("/")
 def home():
     return {"status": "ok", "service": "Mubawab Scraper"}
-
 
 @app.post("/scrape")
 async def scrape(input: ScrapeInput):
