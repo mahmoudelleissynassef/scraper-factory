@@ -1,205 +1,120 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
-from datetime import date
-import re
-import requests
+import httpx
 from bs4 import BeautifulSoup
+import asyncio
+import re
+from datetime import date
 
 app = FastAPI()
 
-# ---------- Config ----------
-UA = {
+# -------- Config --------
+HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     )
 }
-MAX_PAGES = 200
+MAX_PAGES = 200        # safety cap
+CONCURRENT_REQUESTS = 10   # how many pages to scrape in parallel
 
 
-# ---------- Models ----------
+# -------- Models --------
 class ScrapeInput(BaseModel):
     url: str
     city: str
     asset_type: str
-    site_name: str
     listing_type: str
+    site_name: str
     document_name: str
-    pages: int = 1
+    pages: Optional[int] = 1
 
 
-# ---------- Helpers ----------
-def clean_spaces(t: str) -> str:
-    return re.sub(r"\s+", " ", t or "").strip()
-
-
-def parse_price(text: str) -> tuple[Optional[float], Optional[str]]:
-    if not text:
-        return None, None
-    if re.search(r"price\s*on\s*request", text, re.I):
-        return None, None
-
-    m = re.search(r"(?P<num>\d[\d\s.,]*)\s*(?P<cur>DH|MAD|DHS|€|\$)", text, re.I)
-    if not m:
-        m = re.search(r"(DH|MAD|DHS|€|\$)\s*(\d[\d\s.,]*)", text, re.I)
-        if not m:
-            return None, None
-        num = m.group(2)
-        cur = m.group(1)
-    else:
-        num = m.group("num")
-        cur = m.group("cur")
-
-    num = num.replace(" ", "").replace(",", "").replace("\u202f", "")
+# -------- Helpers --------
+async def fetch_page(client: httpx.AsyncClient, url: str, page: int) -> Optional[str]:
+    """Fetch a single page asynchronously, return HTML or None if error."""
+    page_url = f"{url}:p{page}" if page > 1 else url
     try:
-        value = float(num.replace(".", "")) if num.count(".") > 1 else float(num)
-    except ValueError:
-        digits = re.sub(r"[^\d.]", "", num)
-        try:
-            value = float(digits)
-        except ValueError:
-            return None, cur.upper()
-
-    return value, cur.upper()
-
-
-def parse_area(text: str) -> tuple[Optional[float], Optional[str]]:
-    if not text:
-        return None, None
-    m = re.search(r"(?P<num>\d+[\d\s.,]*)\s*(?P<unit>m²|m2|sqm)", text, re.I)
-    if not m:
-        return None, None
-
-    raw = m.group("num").replace(" ", "").replace(",", "").replace("\u202f", "")
-    try:
-        val = float(raw)
-    except ValueError:
-        val = None
-    unit = "m²" if m.group("unit").lower() in ("m²", "m2") else "sqm"
-    return val, unit
-
-
-def extract_location_from_title(title: str) -> Optional[str]:
-    """
-    Extract location from the title.
-    Example:
-      "Offices for rent in Agdal. Dimension 2500 m²" -> "Agdal"
-      "Magnificent villa for sale in Ain Diab - 7 rooms" -> "Ain Diab"
-    """
-    if not title:
-        return None
-    m = re.search(r"\bin\s+([^.,/–—-]+)", title, re.IGNORECASE)
-    if not m:
-        return None
-    loc = clean_spaces(m.group(1))
-    if len(loc) > 60:
-        return None
-    return loc
-
-
-# ---------- Parser ----------
-def scrape_mubawab_list_page(url: str, metadata: dict, pages: int) -> List[dict]:
-    pages = max(1, min(pages, MAX_PAGES))
-    items: List[dict] = []
-
-    for page in range(1, pages + 1):
-        page_url = url if page == 1 else f"{url}:p:{page}"
-        print(f"DEBUG: Fetching {page_url}")
-
-        try:
-            resp = requests.get(page_url, headers=UA, timeout=10)
-            resp.raise_for_status()
-        except Exception as e:
-            print(f"[ERROR] Request failed {page_url}: {e}")
-            break
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        cards = soup.select("div.listingBox")
-        if not cards:
-            print(f"DEBUG: No listings found on {page_url}")
-            break
-
-        for box in cards:
-            text_all = box.get_text(" ", strip=True)
-
-            # Title
-            title = None
-            title_tag = box.select_one(".listTitle, .titleRow, p.listingP, .disFlex.titleRow")
-            if title_tag:
-                title = clean_spaces(title_tag.get_text(" ", strip=True))
-            if not title:
-                a = box.find("a", href=True)
-                if a and len(a.get_text(strip=True)) > 5:
-                    title = clean_spaces(a.get_text(" ", strip=True))
-            if not title:
-                title = clean_spaces(text_all[:140])
-
-            # Link
-            link = ""
-            a_best = box.find("a", href=True)
-            if a_best:
-                link = a_best.get("href")
-            if link and link.startswith("/"):
-                link = "https://www.mubawab.ma" + link
-
-            # Price
-            price, currency = parse_price(text_all)
-
-            # Area
-            area_val, unit = None, None
-            area_string = box.find(string=re.compile(r"\d[\d\s.,]*\s*(m²|m2|sqm)", re.I))
-            if area_string:
-                area_val, unit = parse_area(str(area_string))
-
-            # Image
-            image = ""
-            img = box.find("img")
-            if img:
-                image = img.get("data-src") or img.get("src") or ""
-
-            # Location
-            location = extract_location_from_title(title) or metadata["city"]
-
-            # Price per sqm
-            ppsqm = None
-            if price and area_val and area_val > 0:
-                ppsqm = round(price / area_val, 2)
-
-            items.append({
-                "title": title or "",
-                "price": price,
-                "currency": currency or "",
-                "area": area_val,
-                "unit": unit or "",
-                "location": location,
-                "image": image or "",
-                "link": link or "",
-                "retrieved_at": str(date.today()),
-                "price_per_sqm": ppsqm,
-                "city": metadata["city"],
-                "asset_type": metadata["asset_type"],
-                "listing_type": metadata["listing_type"],
-                "site_name": metadata["site_name"],
-                "document_name": metadata["document_name"],
-            })
-
-    return items
-
-
-# ---------- API ----------
-@app.get("/")
-def home():
-    return {"message": "Mubawab Scraper running!"}
-
-
-@app.post("/scrape")
-def scrape(input: ScrapeInput):
-    try:
-        data = scrape_mubawab_list_page(input.url, input.dict(), input.pages)
-        if not data:
-            raise HTTPException(status_code=404, detail="No listings found")
-        return data
+        resp = await client.get(page_url, headers=HEADERS, timeout=20.0)
+        resp.raise_for_status()
+        return resp.text
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[WARN] Skipping {page_url} due to {e}")
+        return None
+
+
+def parse_mubawab(html: str, base: ScrapeInput) -> List[dict]:
+    """Parse Mubawab HTML and return list of listings."""
+    soup = BeautifulSoup(html, "html.parser")
+    listings = []
+
+    for item in soup.select(".listingBox"):
+        try:
+            title = item.select_one(".listingTit").get_text(strip=True) if item.select_one(".listingTit") else None
+            price = item.select_one(".price").get_text(strip=True) if item.select_one(".price") else None
+            area = item.select_one(".caracteristique .surface").get_text(strip=True) if item.select_one(".caracteristique .surface") else None
+            location = None
+
+            # Extract location from title (after "in" and before first ".")
+            if title:
+                match = re.search(r"in (.*?)\.", title)
+                if match:
+                    location = match.group(1).strip()
+
+            link = item.select_one("a")["href"] if item.select_one("a") else None
+            image = item.select_one("img")["src"] if item.select_one("img") else None
+
+            listings.append({
+                "title": title,
+                "price": price,
+                "area": area,
+                "unit": "m²" if area else None,
+                "location": location,
+                "image": image,
+                "link": link,
+                "retrieved_at": str(date.today()),
+                "city": base.city,
+                "listing_type": base.listing_type,
+                "asset_type": base.asset_type,
+                "document_name": base.document_name,
+                "site_name": base.site_name,
+            })
+        except Exception as e:
+            print(f"[WARN] Failed to parse one item: {e}")
+            continue
+
+    return listings
+
+
+# -------- Routes --------
+@app.post("/scrape")
+async def scrape(input_data: ScrapeInput):
+    listings: List[dict] = []
+
+    async with httpx.AsyncClient() as client:
+        tasks = []
+        max_pages = min(input_data.pages or 1, MAX_PAGES)
+
+        for page in range(1, max_pages + 1):
+            tasks.append(fetch_page(client, input_data.url, page))
+
+        # Run with concurrency limit
+        sem = asyncio.Semaphore(CONCURRENT_REQUESTS)
+
+        async def sem_task(task):
+            async with sem:
+                return await task
+
+        results = await asyncio.gather(*[sem_task(t) for t in tasks])
+
+        # Parse results
+        for html in results:
+            if html:
+                listings.extend(parse_mubawab(html, input_data))
+
+    if not listings:
+        raise HTTPException(status_code=404, detail="No listings found")
+
+    return listings
