@@ -17,11 +17,10 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     )
 }
-MAX_PAGES = 200        # safety cap
-CONCURRENT_REQUESTS = 10   # how many pages to scrape in parallel
+MAX_PAGES = 200
+CONCURRENT_REQUESTS = 10
 
 
-# -------- Models --------
 class ScrapeInput(BaseModel):
     url: str
     city: str
@@ -32,10 +31,9 @@ class ScrapeInput(BaseModel):
     pages: Optional[int] = 1
 
 
-# -------- Helpers --------
 async def fetch_page(client: httpx.AsyncClient, url: str, page: int) -> Optional[str]:
     """Fetch a single page asynchronously, return HTML or None if error."""
-    page_url = f"{url}:p{page}" if page > 1 else url
+    page_url = f"{url}?page={page}" if page > 1 else url   # FIXED pagination
     try:
         resp = await client.get(page_url, headers=HEADERS, timeout=20.0)
         resp.raise_for_status()
@@ -55,16 +53,21 @@ def parse_mubawab(html: str, base: ScrapeInput) -> List[dict]:
             title = item.select_one(".listingTit").get_text(strip=True) if item.select_one(".listingTit") else None
             price = item.select_one(".price").get_text(strip=True) if item.select_one(".price") else None
             area = item.select_one(".caracteristique .surface").get_text(strip=True) if item.select_one(".caracteristique .surface") else None
-            location = None
 
-            # Extract location from title (after "in" and before first ".")
+            # Extract location from title
+            location = None
             if title:
                 match = re.search(r"in (.*?)\.", title)
                 if match:
                     location = match.group(1).strip()
 
             link = item.select_one("a")["href"] if item.select_one("a") else None
-            image = item.select_one("img")["src"] if item.select_one("img") else None
+
+            # FIXED: handle img src OR data-src
+            image = None
+            img_tag = item.select_one("img")
+            if img_tag:
+                image = img_tag.get("src") or img_tag.get("data-src")
 
             listings.append({
                 "title": title,
@@ -88,7 +91,6 @@ def parse_mubawab(html: str, base: ScrapeInput) -> List[dict]:
     return listings
 
 
-# -------- Routes --------
 @app.post("/scrape")
 async def scrape(input_data: ScrapeInput):
     listings: List[dict] = []
@@ -100,7 +102,6 @@ async def scrape(input_data: ScrapeInput):
         for page in range(1, max_pages + 1):
             tasks.append(fetch_page(client, input_data.url, page))
 
-        # Run with concurrency limit
         sem = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
         async def sem_task(task):
@@ -109,7 +110,6 @@ async def scrape(input_data: ScrapeInput):
 
         results = await asyncio.gather(*[sem_task(t) for t in tasks])
 
-        # Parse results
         for html in results:
             if html:
                 listings.extend(parse_mubawab(html, input_data))
